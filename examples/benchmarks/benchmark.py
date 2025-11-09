@@ -3,6 +3,7 @@ import openmm.app as app
 import openmm as mm
 import openmm.unit as unit
 from datetime import datetime, timezone
+import time
 import argparse
 import os
 
@@ -84,6 +85,8 @@ def printTestResult(test_result, options):
             print(f'{key}: {value}')
         print('')
     elif options.style == 'table':
+        # Cast ns/day (Quantity) to float to avoid %-g on a unit'd value
+        ns_per_day = float(test_result['ns_per_day'])
         print('%-18s%-12s%-14s%-15s%-10g%-11s%-11s%-g' %
               (test_result['test'],
                test_result['precision'],
@@ -92,34 +95,45 @@ def printTestResult(test_result, options):
                test_result['timestep_in_fs'],
                test_result['ensemble'],
                test_result['platform'],
-               test_result['ns_per_day']))
+               ns_per_day))
     else:
-        raise ValueError(f"style '{style}' must be one of ['simple', 'table']")
+        raise ValueError(f"style '{options.style}' must be one of ['simple', 'table']")
 
 def timeIntegration(context, steps, initialSteps):
-    """Integrate a Context for a specified number of steps, then return how many seconds it took."""
-    context.getIntegrator().step(initialSteps) # Make sure everything is fully initialized
+    """Integrate a Context for a specified number of steps, return elapsed seconds (high-res, monotonic)."""
+    integ = context.getIntegrator()
+    # Warmup to trigger kernel JIT & caches
+    integ.step(initialSteps)
+    # Explicit device sync via a cheap state query
     context.getState(energy=True)
-    start = datetime.now()
-    context.getIntegrator().step(steps)
-    context.getState(energy=True)
-    end = datetime.now()
-    elapsed = end-start
-    return elapsed.seconds + elapsed.microseconds*1e-6
+    start = time.perf_counter()
+    integ.step(steps)
+    context.getState(energy=True)  # sync
+    return time.perf_counter() - start
 
 def downloadAmberSuite():
-    """Download and extract Amber benchmark to Amber20_Benchmark_Suite/ in current directory."""
-    dirname = 'Amber20_Benchmark_Suite'
+    """Download and extract Amber benchmark to ./Amber20_Benchmark_Suite (idempotent, tolerant to tar layout)."""
+    root = 'Amber20_Benchmark_Suite'
     url = 'https://ambermd.org/Amber20_Benchmark_Suite.tar.gz'
-    if not os.path.exists(dirname):
-        import urllib.request
-        print('Downloading', url)
-        filename, headers = urllib.request.urlretrieve(url, filename='Amber20_Benchmark_Suite.tar.gz')
-        import tarfile
-        print('Extracting', filename)
-        tarfh = tarfile.open(filename, 'r:gz')
-        tarfh.extractall(path=dirname)
-    return dirname
+    if os.path.exists(root):
+        return root
+    import tempfile, urllib.request, tarfile, shutil
+    print('Downloading', url)
+    with tempfile.TemporaryDirectory() as td:
+        tarpath, _ = urllib.request.urlretrieve(url)
+        print('Extracting', tarpath)
+        with tarfile.open(tarpath, 'r:gz') as tf:
+            tf.extractall(td)
+            entries = [e for e in os.listdir(td)]
+            topdir = None
+            for e in entries:
+                path = os.path.join(td, e)
+                if os.path.isdir(path):
+                    topdir = path
+                    break
+            src = topdir if topdir else td
+            shutil.move(src, root)
+    return root
 
 import functools
 @functools.lru_cache(maxsize=None)
@@ -346,12 +360,11 @@ def runOneTest(testName, options):
 
     test_result['timestep_in_fs'] = dt.value_in_unit(unit.femtoseconds)
     properties = {}
-    initialSteps = 5
+    # Use a consistent warmup so kernels & streams are primed before timing.
+    initialSteps = 200
     platform = mm.Platform.getPlatform(options.platform)
     if options.device is not None and 'DeviceIndex' in platform.getPropertyNames():
         properties['DeviceIndex'] = options.device
-        if ',' in options.device or ' ' in options.device:
-            initialSteps = 250
     if options.disable_pme_stream:
         properties['DisablePmeStream'] = 'true'
     if options.opencl_platform is not None and 'OpenCLPlatformIndex' in platform.getPropertyNames():
@@ -365,6 +378,11 @@ def runOneTest(testName, options):
 
     # Create the Context
     integ.setConstraintTolerance(1e-5)
+    # Seed stochastic components (thermostats, etc.) for reproducible timings
+    try:
+        integ.setRandomNumberSeed(60221408)
+    except Exception:
+        pass
     if len(properties) > 0:
         context = mm.Context(system, integ, platform, properties)
     else:
@@ -549,9 +567,13 @@ from openmm import OpenMMException
 from itertools import product
 
 if args.style == 'simple':
-    for (test, args.bond_constraints, args.ensemble, args.precision) in product(tests, bond_constraints, ensembles, precisions):
+    for (test, bc, ens, prec) in product(tests, bond_constraints, ensembles, precisions):
         try:
-            runOneTest(test, args)
+            local = argparse.Namespace(**vars(args))
+            local.bond_constraints = bc
+            local.ensemble = ens
+            local.precision = prec
+            runOneTest(test, local)
         except OpenMMException as e:
             if args.verbose:
                 print(e)
@@ -559,9 +581,13 @@ if args.style == 'simple':
 elif args.style == 'table':
     print()
     print('Test              Precision   Constraints   H mass (amu)   dt (fs)   Ensemble   Platform   ns/day')
-    for (test, args.bond_constraints, args.ensemble, args.precision) in product(tests, bond_constraints, ensembles, precisions):
+    for (test, bc, ens, prec) in product(tests, bond_constraints, ensembles, precisions):
         try:
-            runOneTest(test, args)
+            local = argparse.Namespace(**vars(args))
+            local.bond_constraints = bc
+            local.ensemble = ens
+            local.precision = prec
+            runOneTest(test, local)
         except OpenMMException as e:
             if args.verbose:
                 print(e)
