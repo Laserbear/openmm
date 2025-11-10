@@ -41,6 +41,8 @@
 #include <iterator>
 #include <set>
 #include <assert.h>
+#include <cstdlib>
+#include <string>
 
 using namespace OpenMM;
 using namespace std;
@@ -60,6 +62,26 @@ static void getCudaPmeParameters(CudaContext& cu, bool& usePmeQueue, bool& useFi
 void CudaCalcForcesAndEnergyKernel::initialize(const System& system) {
 }
 
+// ---------------- CUDA Graphs support (optional) ----------------
+#if CUDA_VERSION >= 10000
+namespace {
+inline bool envUseGraphs() {
+    const char* e = std::getenv("OPENMM_CUDA_USE_GRAPHS");
+    return (e != nullptr && std::string(e) == "1");
+}
+}
+
+struct CudaGraphsState {
+    bool enabled = false;
+    bool captured = false;
+    CUgraph graph = nullptr;
+    CUgraphExec exec = nullptr;
+    int interactingTilesSize = -1;
+    int singlePairsSize = -1;
+};
+#endif
+// ---------------------------------------------------------------
+
 void CudaCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
@@ -78,7 +100,60 @@ void CudaCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool 
 double CudaCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups, bool& valid) {
     ContextSelector selector(cu);
     cu.getBondedUtilities().computeInteractions(groups);
-    cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+    // Optionally submit nonbonded via a CUDA Graph (capture the hot launch sequence).
+#if CUDA_VERSION >= 10000
+    static thread_local CudaGraphsState graphs;
+    if (!graphs.enabled)
+        graphs.enabled = envUseGraphs();
+    bool usedGraph = false;
+    if (graphs.enabled) {
+        auto& nb = cu.getNonbondedUtilities();
+        int sigTiles = (int) nb.getInteractingTiles().getSize();
+        int sigPairs = (int) nb.getSinglePairs().getSize();
+        bool needCapture = !graphs.captured || sigTiles != graphs.interactingTilesSize || sigPairs != graphs.singlePairsSize || graphs.exec == nullptr;
+        if (needCapture) {
+            if (graphs.exec) {
+                cuGraphExecDestroy(graphs.exec);
+                graphs.exec = nullptr;
+            }
+            if (graphs.graph) {
+                cuGraphDestroy(graphs.graph);
+                graphs.graph = nullptr;
+            }
+            CUstream s = cu.getCurrentStream();
+            CUresult r = cuStreamBeginCapture(s, CU_STREAM_CAPTURE_MODE_RELAXED);
+            if (r == CUDA_SUCCESS) {
+                nb.computeInteractions(groups, includeForces, includeEnergy);
+                CUgraph g = nullptr;
+                r = cuStreamEndCapture(s, &g);
+                if (r == CUDA_SUCCESS && g != nullptr) {
+                    graphs.graph = g;
+                    CUgraphExec exec = nullptr;
+                    r = cuGraphInstantiate(&exec, g, 0);
+                    if (r == CUDA_SUCCESS) {
+                        graphs.exec = exec;
+                        graphs.captured = true;
+                        graphs.interactingTilesSize = sigTiles;
+                        graphs.singlePairsSize = sigPairs;
+                        usedGraph = true;
+                    }
+                }
+            }
+            if (!usedGraph)
+                nb.computeInteractions(groups, includeForces, includeEnergy);
+        }
+        else {
+            if (graphs.exec) {
+                cuGraphLaunch(graphs.exec, cu.getCurrentStream());
+                usedGraph = true;
+            }
+            if (!usedGraph)
+                nb.computeInteractions(groups, includeForces, includeEnergy);
+        }
+    }
+    else
+#endif
+        cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
