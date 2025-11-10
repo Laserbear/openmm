@@ -41,7 +41,14 @@ CudaArray::CudaArray(CudaContext& context, size_t size, int elementSize, const s
 CudaArray::~CudaArray() {
     if (pointer != 0 && ownsMemory && context->getContextIsValid()) {
         ContextSelector selector(*context);
-        CUresult result = cuMemFree(pointer);
+        // Prefer async free when available (CUDA 11.2+) on the current stream.
+        CUresult result;
+#if CUDA_VERSION >= 11020
+        CUstream stream = context->getCurrentStream();
+        result = cuMemFreeAsync(pointer, stream);
+#else
+        result = cuMemFree(pointer);
+#endif
         if (result != CUDA_SUCCESS) {
             std::stringstream str;
             str<<"Error deleting array "<<name<<": "<<CudaContext::getErrorString(result)<<" ("<<result<<")";
@@ -59,7 +66,14 @@ void CudaArray::initialize(ComputeContext& context, size_t size, int elementSize
     this->name = name;
     ownsMemory = true;
     ContextSelector selector(*this->context);
-    CUresult result = cuMemAlloc(&pointer, size*elementSize);
+    // Use the async memory pool when available (CUDA 11.2+) to avoid device-wide syncs.
+    CUresult result;
+#if CUDA_VERSION >= 11020
+    CUstream stream = this->context->getCurrentStream();
+    result = cuMemAllocAsync(&pointer, size*elementSize, stream);
+#else
+    result = cuMemAlloc(&pointer, size*elementSize);
+#endif
     if (result != CUDA_SUCCESS) {
         std::stringstream str;
         str<<"Error creating array "<<name<<": "<<CudaContext::getErrorString(result)<<" ("<<result<<")";
@@ -73,7 +87,14 @@ void CudaArray::resize(size_t size) {
     if (!ownsMemory)
         throw OpenMMException("Cannot resize an array that does not own its storage");
     ContextSelector selector(*context);
-    CUresult result = cuMemFree(pointer);
+    // Free via the async pool when available (CUDA 11.2+)
+    CUresult result;
+#if CUDA_VERSION >= 11020
+    CUstream stream = context->getCurrentStream();
+    result = cuMemFreeAsync(pointer, stream);
+#else
+    result = cuMemFree(pointer);
+#endif
     if (result != CUDA_SUCCESS) {
         std::stringstream str;
         str<<"Error deleting array "<<name<<": "<<CudaContext::getErrorString(result)<<" ("<<result<<")";
